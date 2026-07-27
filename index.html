@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preview CDN HLS</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 -apple-system, system-ui, sans-serif;
+         display: flex; height: 100vh; }
+  aside { width: 340px; min-width: 180px; max-width: 75vw; flex: 0 0 auto;
+          border-right: 1px solid #8883; padding: 12px; overflow: auto; }
+  #divider { flex: 0 0 6px; cursor: col-resize; background: #8882; }
+  #divider:hover, #divider.drag { background: #4a90e2; }
+  main { flex: 1 1 auto; padding: 16px; display: flex; flex-direction: column;
+         gap: 12px; min-width: 0; }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  select, input, button { font: inherit; padding: 6px 8px; border-radius: 8px;
+         border: 1px solid #8886; background: transparent; color: inherit; }
+  button { cursor: pointer; }
+  .movie { font-weight: 600; margin: 10px 0 4px; word-break: break-word; }
+  .ep { display: block; width: 100%; text-align: left; margin: 3px 0;
+        border: 1px solid #8884; background: #8881;
+        white-space: normal; word-break: break-word; }
+  .ep:hover { background: #4a90e222; border-color: #4a90e2; }
+  .ep.active { background: #4a90e2; color: #fff; border-color: #4a90e2; }
+  video { width: 100%; max-height: 78vh; background: #000; border-radius: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .path { font-family: ui-monospace, monospace; font-size: 12px; opacity: .8;
+          word-break: break-all; }
+  .muted { opacity: .6; }
+  .err { color: #e35; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>CDN: <span id="bkt"></span></h1>
+  <div class="row"><input id="filter" placeholder="Loc Movie..." style="flex:1"></div>
+  <div id="list" class="muted" style="margin-top:10px">Dang tai danh sach...</div>
+</aside>
+<div id="divider" title="Keo de doi rong sidebar"></div>
+<main>
+  <div class="row">
+    <input id="manual" placeholder="Hoac dan object master.m3u8 (Drama/Movie_.../master.m3u8)..." style="flex:1">
+    <button onclick="playManual()">Phat</button>
+  </div>
+  <div id="now" class="path muted">Chua chon video.</div>
+  <video id="v" controls playsinline></video>
+  <div id="msg" class="muted"></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+// ==== Cau hinh CDN (doc truc tiep, khong can backend/credential) ====
+const CDN    = 'https://cdn-prod.shortdramaict.online';
+const BUCKET = 'demo-dram-xyz';
+let   PREFIX = 'testdi/';                 // luon co dau '/' o cuoi
+if (PREFIX && !PREFIX.endsWith('/')) PREFIX += '/';
+
+const $ = s => document.querySelector(s);
+let hls = null, movies = [];
+$('#bkt').textContent = BUCKET;
+
+// ==== Goi S3 ListObjectsV2 qua CDN, tu dong phan trang ====
+async function listAll(params) {
+  let token = null;
+  const prefixes = [], keys = [];
+  do {
+    const q = new URLSearchParams({ 'list-type': '2', ...params });
+    if (token) q.set('continuation-token', token);
+    const r = await fetch(`${CDN}/${BUCKET}/?${q.toString()}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const xml = new DOMParser().parseFromString(await r.text(), 'application/xml');
+    xml.querySelectorAll('CommonPrefixes > Prefix').forEach(p => prefixes.push(p.textContent));
+    xml.querySelectorAll('Contents > Key').forEach(k => keys.push(k.textContent));
+    const trunc = (xml.querySelector('IsTruncated')?.textContent || '') === 'true';
+    token = trunc ? (xml.querySelector('NextContinuationToken')?.textContent || null) : null;
+  } while (token);
+  return { prefixes, keys };
+}
+
+function niceLabel(label) {
+  const ep  = (label.match(/Episode_\d+/) || [])[0];
+  const vid = (label.match(/video_\d+/i) || [])[0];
+  return ep ? (ep + (vid ? ' · ' + vid : '')) : label;
+}
+
+function play(objectPath) {
+  const v = $('#v');
+  const url = `${CDN}/${BUCKET}/` + objectPath.split('/').map(encodeURIComponent).join('/');
+  $('#now').textContent = objectPath; $('#now').classList.remove('muted','err');
+  $('#msg').textContent = '';
+  if (hls) { hls.destroy(); hls = null; }
+  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; v.play().catch(()=>{}); }
+  else if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ lowLatencyMode: false });
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) $('#msg').innerHTML =
+      '<span class="err">Loi HLS: ' + d.type + ' / ' + d.details + '</span>'; });
+    hls.loadSource(url); hls.attachMedia(v); v.play().catch(()=>{});
+  } else { $('#msg').innerHTML = '<span class="err">Trinh duyet khong ho tro HLS.</span>'; }
+  document.querySelectorAll('.ep').forEach(b => b.classList.toggle('active', b.dataset.p === objectPath));
+}
+
+function playManual() {
+  const p = $('#manual').value.trim(); if (p) play(p);
+}
+
+async function loadEpisodes(movie, container) {
+  container.innerHTML = '<div class="muted">Dang tai...</div>';
+  try {
+    const prefix = `${PREFIX}${movie}/`;
+    const { keys } = await listAll({ prefix });
+    const masters = keys
+      .filter(k => k.endsWith('/master.m3u8'))
+      .map(k => ({ object: k, label: k.slice(prefix.length).replace(/\/master\.m3u8$/, '') || 'master' }))
+      .sort((a, b) => a.object.localeCompare(b.object));
+    if (!masters.length) { container.innerHTML = '<div class="muted">Khong co master.m3u8.</div>'; return; }
+    container.innerHTML = '';
+    masters.forEach(m => {
+      const b = document.createElement('button');
+      b.className = 'ep'; b.textContent = niceLabel(m.label); b.title = m.object;
+      b.dataset.p = m.object;
+      b.onclick = () => play(m.object);
+      container.appendChild(b);
+    });
+  } catch (e) { container.innerHTML = '<div class="err">Loi: ' + e + '</div>'; }
+}
+
+function render(filter) {
+  const list = $('#list'); list.innerHTML = ''; list.classList.remove('muted');
+  const shown = movies.filter(m => m.toLowerCase().includes(filter.toLowerCase()));
+  if (!shown.length) { list.innerHTML = '<div class="muted">Khong co Movie khop.</div>'; return; }
+  shown.forEach(movie => {
+    const head = document.createElement('div');
+    head.className = 'movie'; head.textContent = '▸ ' + movie; head.style.cursor = 'pointer';
+    const body = document.createElement('div'); body.style.display = 'none';
+    let loaded = false;
+    head.onclick = () => {
+      const open = body.style.display === 'none';
+      body.style.display = open ? 'block' : 'none';
+      head.textContent = (open ? '▾ ' : '▸ ') + movie;
+      if (open && !loaded) { loaded = true; loadEpisodes(movie, body); }
+    };
+    list.appendChild(head); list.appendChild(body);
+  });
+}
+
+async function init() {
+  try {
+    const { prefixes } = await listAll({ prefix: PREFIX, delimiter: '/' });
+    movies = prefixes.map(p => p.slice(PREFIX.length).replace(/\/$/, '')).filter(Boolean).sort();
+    if (!movies.length) { $('#list').innerHTML = '<div class="muted">Bucket rong hoac sai prefix.</div>'; return; }
+    render('');
+  } catch (e) { $('#list').innerHTML = '<div class="err">Loi tai danh sach: ' + e + '</div>'; }
+}
+$('#filter').addEventListener('input', e => render(e.target.value));
+
+// Keo thanh chia de doi rong sidebar, nho lai qua localStorage.
+(function () {
+  const divider = $('#divider'), aside = document.querySelector('aside');
+  const saved = parseInt(localStorage.getItem('sbw') || '', 10);
+  if (saved) aside.style.width = saved + 'px';
+  let dragging = false;
+  divider.addEventListener('mousedown', e => {
+    dragging = true; divider.classList.add('drag');
+    document.body.style.userSelect = 'none'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const w = Math.max(180, Math.min(e.clientX, window.innerWidth * 0.75));
+    aside.style.width = w + 'px'; localStorage.setItem('sbw', String(Math.round(w)));
+  });
+  window.addEventListener('mouseup', () => {
+    if (dragging) { dragging = false; divider.classList.remove('drag'); document.body.style.userSelect = ''; }
+  });
+})();
+
+init();
+</script>
+</body>
+</html>
