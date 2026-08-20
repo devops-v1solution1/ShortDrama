@@ -35,16 +35,12 @@
 </head>
 <body>
 <aside>
-  <h1>CDN: <span id="bkt"></span></h1>
+  <h1>Demo Drama</h1>
   <div class="row"><input id="filter" placeholder="Loc Movie..." style="flex:1"></div>
   <div id="list" class="muted" style="margin-top:10px">Dang tai danh sach...</div>
 </aside>
 <div id="divider" title="Keo de doi rong sidebar"></div>
 <main>
-  <div class="row">
-    <input id="manual" placeholder="Hoac dan object master.m3u8 (Drama/Movie_.../master.m3u8)..." style="flex:1">
-    <button onclick="playManual()">Phat</button>
-  </div>
   <div id="now" class="path muted">Chua chon video.</div>
   <video id="v" controls playsinline></video>
   <div id="msg" class="muted"></div>
@@ -59,7 +55,6 @@ if (PREFIX && !PREFIX.endsWith('/')) PREFIX += '/';
 
 const $ = s => document.querySelector(s);
 let hls = null, movies = [];
-$('#bkt').textContent = BUCKET;
 
 // ==== Goi S3 ListObjectsV2 qua CDN, tu dong phan trang ====
 async function listAll(params) {
@@ -85,42 +80,83 @@ function niceLabel(label) {
   return ep ? (ep + (vid ? ' · ' + vid : '')) : label;
 }
 
-function play(objectPath) {
+function play(objectPath, onFatal) {
   const v = $('#v');
   const url = `${CDN}/${BUCKET}/` + objectPath.split('/').map(encodeURIComponent).join('/');
   $('#now').textContent = objectPath; $('#now').classList.remove('muted','err');
   $('#msg').textContent = '';
   if (hls) { hls.destroy(); hls = null; }
-  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; v.play().catch(()=>{}); }
+  // onFatal chi duoc truyen o lan thu dau tien voi duong dan suy ra; neu hong thi di tim that.
+  const fail = msg => { if (onFatal) onFatal(); else $('#msg').innerHTML = '<span class="err">' + msg + '</span>'; };
+  v.onerror = null;
+  if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.onerror = () => fail('Loi tai video.');
+    v.src = url; v.play().catch(()=>{});
+  }
   else if (window.Hls && Hls.isSupported()) {
     hls = new Hls({ lowLatencyMode: false });
-    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) $('#msg').innerHTML =
-      '<span class="err">Loi HLS: ' + d.type + ' / ' + d.details + '</span>'; });
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) fail('Loi HLS: ' + d.type + ' / ' + d.details); });
     hls.loadSource(url); hls.attachMedia(v); v.play().catch(()=>{});
   } else { $('#msg').innerHTML = '<span class="err">Trinh duyet khong ho tro HLS.</span>'; }
   document.querySelectorAll('.ep').forEach(b => b.classList.toggle('active', b.dataset.p === objectPath));
 }
 
-function playManual() {
-  const p = $('#manual').value.trim(); if (p) play(p);
+// Fallback: chi chay khi duong dan suy ra khong dung. List de quy 1 tap (~200 key, 1 trang).
+async function findMaster(epPrefix) {
+  const { keys } = await listAll({ prefix: epPrefix });
+  return keys.find(k => k.endsWith('/master.m3u8')) || null;
 }
 
+async function playEpisode(btn, epPrefix, guess) {
+  const resolve = async () => {
+    const real = await findMaster(epPrefix);
+    if (real) { btn.dataset.p = real; btn.title = real; play(real); }
+    else { $('#msg').innerHTML = '<span class="err">Khong tim thay master.m3u8 trong ' + epPrefix + '</span>'; }
+  };
+  if (guess) play(guess, resolve);
+  else { $('#msg').textContent = 'Dang tim master.m3u8...'; try { await resolve(); }
+         catch (e) { $('#msg').innerHTML = '<span class="err">Loi: ' + e + '</span>'; } }
+}
+
+// Fallback cho movie khong theo cau truc <movie>/Episode/: quet de quy nhu ban cu.
+async function loadEpisodesDeep(movie, container) {
+  container.innerHTML = '<div class="muted">Dang quet toan bo thu muc...</div>';
+  const prefix = `${PREFIX}${movie}/`;
+  const { keys } = await listAll({ prefix });
+  const masters = keys.filter(k => k.endsWith('/master.m3u8'))
+    .map(k => ({ object: k, label: k.slice(prefix.length).replace(/\/master\.m3u8$/, '') || 'master' }))
+    .sort((a, b) => a.object.localeCompare(b.object));
+  if (!masters.length) { container.innerHTML = '<div class="muted">Khong co master.m3u8.</div>'; return; }
+  container.innerHTML = '';
+  masters.forEach(m => {
+    const b = document.createElement('button');
+    b.className = 'ep'; b.textContent = niceLabel(m.label); b.title = m.object;
+    b.dataset.p = m.object;
+    b.onclick = () => play(m.object);
+    container.appendChild(b);
+  });
+}
+
+// Chi list 1 cap thu muc (delimiter) roi suy ra duong dan master tu so tap,
+// thay vi list de quy toan bo segment cua ca bo phim.
 async function loadEpisodes(movie, container) {
   container.innerHTML = '<div class="muted">Dang tai...</div>';
   try {
-    const prefix = `${PREFIX}${movie}/`;
-    const { keys } = await listAll({ prefix });
-    const masters = keys
-      .filter(k => k.endsWith('/master.m3u8'))
-      .map(k => ({ object: k, label: k.slice(prefix.length).replace(/\/master\.m3u8$/, '') || 'master' }))
-      .sort((a, b) => a.object.localeCompare(b.object));
-    if (!masters.length) { container.innerHTML = '<div class="muted">Khong co master.m3u8.</div>'; return; }
+    const base = `${PREFIX}${movie}/Episode/`;
+    const { prefixes } = await listAll({ prefix: base, delimiter: '/' });
+    const eps = prefixes.map(p => p.slice(base.length).replace(/\/$/, ''))
+                        .filter(Boolean).sort((a, b) => a.localeCompare(b));
+    if (!eps.length) return loadEpisodesDeep(movie, container);
     container.innerHTML = '';
-    masters.forEach(m => {
+    eps.forEach(ep => {
+      const epPrefix = `${base}${ep}/`;
+      const n = (ep.match(/(\d+)/) || [])[1];
+      const guess = n ? `${epPrefix}Video/video_${n}_hls/master.m3u8` : null;
       const b = document.createElement('button');
-      b.className = 'ep'; b.textContent = niceLabel(m.label); b.title = m.object;
-      b.dataset.p = m.object;
-      b.onclick = () => play(m.object);
+      b.className = 'ep'; b.textContent = niceLabel(n ? `${ep} video_${n}` : ep);
+      b.title = guess || epPrefix;
+      b.dataset.p = guess || '';
+      b.onclick = () => playEpisode(b, epPrefix, guess);
       container.appendChild(b);
     });
   } catch (e) { container.innerHTML = '<div class="err">Loi: ' + e + '</div>'; }
